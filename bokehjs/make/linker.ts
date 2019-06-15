@@ -1,14 +1,18 @@
 import {resolve, relative, join, dirname, basename, sep} from "path"
 const {_builtinLibs} = require("repl")
+import * as crypto from "crypto"
 
 import * as ts from "typescript"
+import * as terser from "terser"
 
 import * as combine from "combine-source-map"
 import * as convert from "convert-source-map"
 
-import {read, write, fileExists, directoryExists} from "./fs"
+import {read, write, fileExists, directoryExists, rename} from "./fs"
 import {prelude, plugin_prelude} from "./prelude"
 import * as transforms from "../src/compiler/transforms"
+
+export type Path = string
 
 const to_obj = <T>(map: Map<string, T>): {[key: string]: T} => {
   const obj = Object.create(null)
@@ -146,7 +150,6 @@ export class Linker {
 
         const mod = modules.get(file)!
         mod.rewrite_deps(module_map)
-        mod.transform()
 
         bundled.push(mod)
 
@@ -211,8 +214,8 @@ export class Linker {
 
   protected readonly ext = ".js"
 
-  protected resolve_relative(dep: string, parent: Module): string {
-    const path = resolve(parent.dir, dep)
+  protected resolve_relative(dep: string, parent: Parent): string {
+    const path = resolve(dirname(parent.file), dep)
 
     if (fileExists(path))
       return path
@@ -233,7 +236,7 @@ export class Linker {
       throw new Error(`can't resolve '${dep}' from '${parent.file}'`)
   }
 
-  protected resolve_absolute(dep: string, parent: Module): string {
+  protected resolve_absolute(dep: string, parent: Parent): string {
     const resolve_with_index = (path: string): string | null => {
       let index = "index" + this.ext
 
@@ -292,30 +295,132 @@ export class Linker {
     throw new Error(`can't resolve '${dep}' from '${parent.file}'`)
   }
 
-  resolve(dep: string, parent: Module): string {
-    if (dep[0] === ".")
+  resolve_file(dep: string, parent: Parent): Path {
+    if (dep.startsWith("."))
       return this.resolve_relative(dep, parent)
     else
       return this.resolve_absolute(dep, parent)
   }
+
+  new_module(file: Path): ModuleInfo {
+    const source = read(file)!
+    const hash = crypto.createHash("sha256").update(source).digest("hex")
+    const is_external = file.split(sep).includes("node_modules")
+    const is_json = file.endsWith(".json")
+    const is_css = file.endsWith(".css")
+    const [base, canonical] = (() => {
+      for (const base of this.bases) {
+        const path = relative(base, file)
+        if (!path.startsWith("..")) {
+          return [base, path.replace(/\.js$/, "").replace(/\\/g, "/")]
+        }
+      }
+
+      throw new Error(`unable to compute canonical representation of ${file}`)
+    })()
+    const ast = (() => {
+      let ast = transforms.parse_es(file, source)
+      if (is_json)
+        ast = transforms.add_json_export(ast)
+      ast = transforms.wrap_in_function(ast, canonical)
+      return ast
+    })()
+
+    const dependencies = new Map<string, Path>()
+    for (const dep of transforms.collect_deps(ast)) {
+      dependencies.set(dep, this.resolve_file(dep, {file}))
+    }
+
+    return {
+      file,
+      base,
+      canonical,
+      hash,
+      source,
+      ast,
+      external: is_external,
+      type: is_json ? "json" : (is_css ? "css" : "js"),
+      dependencies,
+    }
+  }
+
+  resolve(files: Path[]/*, cache: ModuleInfo[]*/): ModuleInfo[] {
+    const visited = new Map<Path, ModuleInfo>()
+    const pending = files.map((file) => resolve(file))
+
+    for (;;) {
+      const file = pending.shift()
+
+      if (file == null)
+        break
+      if (visited.has(file) || this.excludes.has(file))
+        continue
+
+      const module = this.new_module(file)
+      visited.set(module.file, module)
+      pending.unshift(...module.dependencies.values())
+    }
+
+    const modules = [...visited.values()]
+    for (const module of modules) {
+      console.log(module)
+    }
+    /*
+    const modules_map = new Map(modules.map((module, i) => [module.file, i]))
+    for (const module of modules) {
+      module.rewrite_deps(modules_map)
+    }
+    */
+    return modules
+  }
+}
+
+export interface Parent {
+  file: Path
+}
+
+export interface ModuleInfo {
+  file: Path
+  base: Path
+  canonical: string
+  hash: string
+  source: string
+  type: "js" | "json" | "css"
+  external: boolean
+  ast: ts.SourceFile
+  dependencies: Map<string, Path>
+}
+
+export interface ModuleContent {
+  code: string
+  map?: string
+  min_code: string
+  min_map?: string
 }
 
 export class Module {
   protected ast: ts.SourceFile
   readonly deps = new Map<string, string>()
+
   protected _source: string | null
+  protected _map: string | null
 
   constructor(readonly file: string, protected readonly linker: Linker) {
     this.ast = transforms.parse_es(file)
 
+    if (this.is_json)
+      this.ast = transforms.add_json_export(this.ast)
+
+    this.ast = transforms.wrap_in_function(this.ast, this.canonical)
+
     for (const dep of this.collect_deps()) {
       if (!this.linker.ignores.has(dep))
-        this.deps.set(dep, linker.resolve(dep, this))
+        this.deps.set(dep, linker.resolve_file(dep, this))
     }
   }
 
   get is_external(): boolean {
-    return this.file.split(sep).indexOf("node_modules") !== -1
+    return this.file.split(sep).includes("node_modules")
   }
 
   get is_json(): boolean {
@@ -345,19 +450,16 @@ export class Module {
     return transforms.collect_deps(this.ast)
   }
 
+  /*
+  rewrite_deps2(modules: Map<string, Module>): void {
+    const rewrite_deps = transforms.rewrite_deps((dep) => module.get(this.deps.get(dep)!))
+    this.ast = transforms.apply(this.ast, rewrite_deps)
+  }
+  */
+
   rewrite_deps(module_map: Map<string, number>): void {
     const rewrite_deps = transforms.rewrite_deps((dep) => module_map.get(this.deps.get(dep)!))
     this.ast = transforms.apply(this.ast, rewrite_deps)
-  }
-
-  transform(): void {
-    let {ast} = this
-
-    if (this.is_json)
-      ast = transforms.add_json_export(ast)
-
-    ast = transforms.wrap_in_function(ast, this.canonical)
-    this.ast = ast
   }
 
   protected generate_source(): string {
@@ -369,5 +471,34 @@ export class Module {
     if (this._source == null)
       this._source = this.generate_source()
     return this._source
+  }
+
+  minify(): void {
+    const name = basename(this.file)
+    const min_js = rename(name, {ext: '.min.js'})
+    const min_js_map = rename(name, {ext: '.min.js.map'})
+
+    const minify_opts = {
+      output: {
+        comments: /^!|copyright|license|\(c\)/i,
+      },
+      sourceMap: {
+        filename: basename(min_js),
+        url: basename(min_js_map),
+      },
+    }
+
+    const {code, map, error} = terser.minify(this.source, minify_opts)
+
+    if (error != null) {
+      const {message, line, col} = error as any
+      throw new Error(`${this.file}:${line-1}:${col}: ${message}`)
+    }
+
+    if (code != null)
+      this._source = code
+
+    if (map != null)
+      this._map = map
   }
 }
